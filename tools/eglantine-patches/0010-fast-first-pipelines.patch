@@ -1,5 +1,5 @@
 diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
-index a689d81..52f5e72 100644
+index a689d81..f12c84f 100644
 --- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
 +++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
 @@ -37,6 +37,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
@@ -127,7 +127,19 @@ index a689d81..52f5e72 100644
  bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                  Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
                                  BufferCache& buffer_cache, TextureCache& texture_cache) {
-@@ -315,7 +341,10 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+@@ -274,8 +300,11 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+     if (!is_built.load(std::memory_order::relaxed)) {
+         // Wait for the pipeline to be built
+         scheduler.Record([this](vk::CommandBuffer) {
++            const auto wait_begin{std::chrono::steady_clock::now()};
+             std::unique_lock lock{build_mutex};
+             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
++            lock.unlock();
++            ReportPipelineBuildWait(std::chrono::steady_clock::now() - wait_begin);
+         });
+     }
+ 
+@@ -315,7 +344,10 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
          if (!pipeline) {
              return;
          }
@@ -172,10 +184,46 @@ index fba0519..3770175 100644
      std::condition_variable build_condvar;
      std::mutex build_mutex;
 diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
-index 7cfe5ff..f779765 100644
+index 7cfe5ff..6e15ab3 100644
 --- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
 +++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
-@@ -255,7 +255,7 @@ GraphicsPipeline::GraphicsPipeline(
+@@ -249,13 +249,43 @@ ConfigureFuncPtr ConfigureFunc(const std::array<vk::ShaderModule, NUM_STAGES>& m
+ }
+ } // Anonymous namespace
+ 
++void ReportPipelineBuildWait(std::chrono::steady_clock::duration wait) {
++    using Clock = std::chrono::steady_clock;
++    static Clock::time_point window{Clock::now()};
++    static Clock::duration total{};
++    static Clock::duration longest{};
++    static u32 waits{};
++    static u32 logged{};
++    const auto ms = [](Clock::duration value) {
++        return std::chrono::duration<double, std::milli>(value).count();
++    };
++    total += wait;
++    longest = std::max(longest, wait);
++    ++waits;
++    if (wait > std::chrono::milliseconds{100} && logged < 200) {
++        ++logged;
++        LOG_INFO(Render_Vulkan, "The GPU worker waited {:.1f} ms for a pipeline being built",
++                 ms(wait));
++    }
++    const auto now{Clock::now()};
++    if (now - window > std::chrono::seconds{10}) {
++        LOG_INFO(Render_Vulkan,
++                 "Pipeline build waits in the last {:.0f} s: {}, {:.1f} ms in all, longest {:.1f} ms",
++                 std::chrono::duration<double>(now - window).count(), waits, ms(total), ms(longest));
++        window = now;
++        total = {};
++        longest = {};
++        waits = 0;
++    }
++}
++
+ // TODO(crueter): This is the worst-formatted code I have EVER seen
+ GraphicsPipeline::GraphicsPipeline(
+     Scheduler& scheduler_, BufferCache& buffer_cache_, TextureCache& texture_cache_,
      vk::PipelineCache& pipeline_cache_, VideoCore::ShaderNotify* shader_notify,
      const Device& device_, DescriptorPool& descriptor_pool,
      GuestDescriptorQueue& guest_descriptor_queue_, DescriptorBufferRing& descriptor_buffer_ring_,
@@ -184,7 +232,7 @@ index 7cfe5ff..f779765 100644
      PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
      const GraphicsPipelineCacheKey& key_, std::shared_ptr<const GraphicsShaderModules> modules,
      const std::array<const Shader::Info*, NUM_STAGES>& infos)
-@@ -312,11 +312,18 @@ GraphicsPipeline::GraphicsPipeline(
+@@ -312,11 +342,18 @@ GraphicsPipeline::GraphicsPipeline(
          }
      }
  
@@ -205,7 +253,7 @@ index 7cfe5ff..f779765 100644
          } catch (const vk::Exception& exception) {
              LOG_CRITICAL(Render_Vulkan, "Graphics pipeline build failed: {}", exception.what());
              std::scoped_lock lock{build_mutex};
-@@ -330,6 +337,20 @@ GraphicsPipeline::GraphicsPipeline(
+@@ -330,6 +367,20 @@ GraphicsPipeline::GraphicsPipeline(
          if (pipeline_statistics) {
              pipeline_statistics->Collect(device, *pipeline);
          }
@@ -226,7 +274,19 @@ index 7cfe5ff..f779765 100644
  
          std::scoped_lock lock{build_mutex};
          is_built = true;
-@@ -678,7 +699,10 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+@@ -635,8 +686,11 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+     if (!is_built.load(std::memory_order::relaxed)) {
+         // Wait for the pipeline to be built
+         scheduler.Record([this](vk::CommandBuffer) {
++            const auto wait_begin{std::chrono::steady_clock::now()};
+             std::unique_lock lock{build_mutex};
+             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
++            lock.unlock();
++            ReportPipelineBuildWait(std::chrono::steady_clock::now() - wait_begin);
+         });
+     }
+     const bool is_rescaling{texture_cache.IsRescaling()};
+@@ -678,7 +732,10 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
              if (!pipeline) {
                  return;
              }
@@ -238,7 +298,7 @@ index 7cfe5ff..f779765 100644
          }
          cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
                               RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
-@@ -716,7 +740,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+@@ -716,7 +773,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
      return true;
  }
  
@@ -248,7 +308,7 @@ index 7cfe5ff..f779765 100644
      FixedPipelineState::DynamicState dynamic{};
      if (!key.state.extended_dynamic_state) {
          dynamic = key.state.dynamic_state;
-@@ -1101,7 +1126,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+@@ -1101,7 +1159,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                  .pSpecializationInfo = nullptr,
              });
      }
@@ -257,7 +317,7 @@ index 7cfe5ff..f779765 100644
      if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
          flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
      }
-@@ -1109,7 +1134,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+@@ -1109,7 +1167,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
          flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
      }
  
@@ -266,7 +326,7 @@ index 7cfe5ff..f779765 100644
          .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
          .pNext = nullptr,
          .flags = flags,
-@@ -1129,7 +1154,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+@@ -1129,7 +1187,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
          .subpass = 0,
          .basePipelineHandle = nullptr,
          .basePipelineIndex = 0,
@@ -277,7 +337,7 @@ index 7cfe5ff..f779765 100644
  
      // Log graphics pipeline creation
      if (GPU::Logging::IsActive()) {
-@@ -1140,6 +1167,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+@@ -1140,6 +1200,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
          );
          GPU::Logging::GPULogger::GetInstance().LogPipelineStateChange(pipeline_info);
      }
@@ -286,10 +346,29 @@ index 7cfe5ff..f779765 100644
  
  void GraphicsPipeline::Validate() {
 diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
-index 39fd868..264784d 100644
+index 39fd868..f03542c 100644
 --- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
 +++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
-@@ -88,6 +88,7 @@ public:
+@@ -9,6 +9,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <condition_variable>
+ #include <memory>
+ #include <mutex>
+@@ -78,6 +79,10 @@ class RescalingPushConstant;
+ class RenderAreaPushConstant;
+ class Scheduler;
+ 
++/// The scheduler's worker waited this long for a pipeline still being built, while the GPU had
++/// nothing new to run: logs a long wait, and the waits of every 10 s or more. Worker thread only.
++void ReportPipelineBuildWait(std::chrono::steady_clock::duration wait);
++
+ class GraphicsPipeline {
+     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
+ 
+@@ -88,6 +93,7 @@ public:
          const Device& device, DescriptorPool& descriptor_pool,
          GuestDescriptorQueue& guest_descriptor_queue,
          DescriptorBufferRing& descriptor_buffer_ring, Common::ThreadWorker* worker_thread,
@@ -297,7 +376,7 @@ index 39fd868..264784d 100644
          PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
          const GraphicsPipelineCacheKey& key,
          std::shared_ptr<const GraphicsShaderModules> modules,
-@@ -147,7 +148,7 @@ private:
+@@ -147,7 +153,7 @@ private:
      bool ConfigureDraw(const RescalingPushConstant& rescaling,
                         const RenderAreaPushConstant& render_are);
  
@@ -306,7 +385,7 @@ index 39fd868..264784d 100644
  
      void Validate();
  
-@@ -182,6 +183,10 @@ private:
+@@ -182,6 +188,10 @@ private:
      vk::PipelineLayout pipeline_layout;
      vk::DescriptorUpdateTemplate descriptor_update_template;
      vk::Pipeline pipeline;
