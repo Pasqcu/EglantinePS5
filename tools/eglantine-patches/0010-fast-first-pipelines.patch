@@ -1,0 +1,412 @@
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index a689d81..52f5e72 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -37,6 +37,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+                                  GuestDescriptorQueue& guest_descriptor_queue_,
+                                  DescriptorBufferRing& descriptor_buffer_ring_,
+                                  Common::ThreadWorker* thread_worker,
++                                 Common::ThreadWorker* optimize_worker,
+                                  PipelineStatistics* pipeline_statistics,
+                                  VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
+                                  vk::ShaderModule spv_module_, u64 shader_hash_)
+@@ -89,42 +90,13 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+         }
+     }
+ 
+-    auto func{[this, shader_notify, pipeline_statistics] {
+-        const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
+-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+-            .pNext = nullptr,
+-            .requiredSubgroupSize = GuestWarpSize,
+-        };
+-        VkPipelineCreateFlags flags{};
+-        if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
+-            flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+-        }
+-        if (uses_descriptor_buffer) {
+-            flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+-        }
+-        const VkComputePipelineCreateInfo compute_ci{
+-            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+-            .pNext = nullptr,
+-            .flags = flags,
+-            .stage{
+-                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+-                .pNext =
+-                    device.IsExtSubgroupSizeControlSupported() ? &subgroup_size_ci : nullptr,
+-                .flags = info.uses_tensor_mul_add
+-                             ? VkPipelineShaderStageCreateFlags{
+-                                   VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT}
+-                             : 0U,
+-                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+-                .module = *spv_module,
+-                .pName = "main",
+-                .pSpecializationInfo = nullptr,
+-            },
+-            .layout = *pipeline_layout,
+-            .basePipelineHandle = 0,
+-            .basePipelineIndex = 0,
+-        };
++    // Fast-first pipelines (EDEN_FAST_FIRST_PIPELINES, vk_pipeline_cache.cpp): a pipeline built
++    // while the game runs, which its first dispatch waits for, is built without the driver's
++    // optimizations, in a fraction of the time, then again with them on the optimize worker.
++    const bool fast_first{thread_worker != nullptr && optimize_worker != nullptr};
++    auto func{[this, shader_notify, pipeline_statistics, optimize_worker, fast_first] {
+         try {
+-            pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
++            pipeline = MakePipeline(fast_first ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0);
+         } catch (const vk::Exception& exception) {
+             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
+                          exception.what());
+@@ -147,6 +119,20 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+         if (pipeline_statistics) {
+             pipeline_statistics->Collect(device, *pipeline);
+         }
++        if (fast_first) {
++            // The pipeline cache outlives the optimize worker, which drops queued rebuilds and
++            // finishes the running one when it stops (vk_pipeline_cache.h).
++            optimize_worker->QueueWork([this] {
++                try {
++                    optimized_pipeline = MakePipeline(0);
++                    optimized_ready.store(true, std::memory_order_release);
++                } catch (const vk::Exception& exception) {
++                    // The unoptimized pipeline stays in use.
++                    LOG_WARNING(Render_Vulkan, "Optimized compute pipeline {:016X} build failed: {}",
++                                shader_hash, exception.what());
++                }
++            });
++        }
+         std::scoped_lock lock{build_mutex};
+         is_built = true;
+         build_condvar.notify_one();
+@@ -161,6 +147,46 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+     }
+ }
+ 
++vk::Pipeline ComputePipeline::MakePipeline(VkPipelineCreateFlags extra_flags) {
++    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
++        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
++        .pNext = nullptr,
++        .requiredSubgroupSize = GuestWarpSize,
++    };
++    VkPipelineCreateFlags flags{extra_flags};
++    if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
++        flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
++    }
++    if (uses_descriptor_buffer) {
++        flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
++    }
++    const VkComputePipelineCreateInfo compute_ci{
++        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
++        .pNext = nullptr,
++        .flags = flags,
++        .stage{
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++            .pNext =
++                device.IsExtSubgroupSizeControlSupported() ? &subgroup_size_ci : nullptr,
++            .flags = info.uses_tensor_mul_add
++                         ? VkPipelineShaderStageCreateFlags{
++                               VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT}
++                         : 0U,
++            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
++            .module = *spv_module,
++            .pName = "main",
++            .pSpecializationInfo = nullptr,
++        },
++        .layout = *pipeline_layout,
++        .basePipelineHandle = 0,
++        .basePipelineIndex = 0,
++    };
++    // The unoptimized pipeline lives one session: the next boot builds it optimized.
++    const bool unoptimized{(extra_flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0};
++    return device.GetLogical().CreateComputePipeline(
++        compute_ci, unoptimized ? VkPipelineCache{VK_NULL_HANDLE} : *pipeline_cache);
++}
++
+ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+                                 Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
+                                 BufferCache& buffer_cache, TextureCache& texture_cache) {
+@@ -315,7 +341,10 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+         if (!pipeline) {
+             return;
+         }
+-        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
++        // Both variants share the layout: what is bound with one stays valid with the other.
++        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE,
++                            optimized_ready.load(std::memory_order_acquire) ? *optimized_pipeline
++                                                                            : *pipeline);
+         if (!descriptor_set_layout) {
+             return;
+         }
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.h b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+index fba0519..3770175 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+@@ -38,6 +38,7 @@ public:
+                              GuestDescriptorQueue& guest_descriptor_queue,
+                              DescriptorBufferRing& descriptor_buffer_ring,
+                              Common::ThreadWorker* thread_worker,
++                             Common::ThreadWorker* optimize_worker,
+                              PipelineStatistics* pipeline_statistics,
+                              VideoCore::ShaderNotify* shader_notify, const Shader::Info& info,
+                              vk::ShaderModule spv_module, u64 shader_hash);
+@@ -57,6 +58,8 @@ public:
+     }
+ 
+ private:
++    vk::Pipeline MakePipeline(VkPipelineCreateFlags extra_flags);
++
+     const Device& device;
+     vk::PipelineCache& pipeline_cache;
+     GuestDescriptorQueue& guest_descriptor_queue;
+@@ -76,6 +79,10 @@ private:
+     vk::PipelineLayout pipeline_layout;
+     vk::DescriptorUpdateTemplate descriptor_update_template;
+     vk::Pipeline pipeline;
++    /// Fast-first pipelines: `pipeline` was built without the driver's optimizations and this one
++    /// with them, on the optimize worker. Dispatches take it once optimized_ready is set.
++    vk::Pipeline optimized_pipeline;
++    std::atomic_bool optimized_ready{false};
+ 
+     std::condition_variable build_condvar;
+     std::mutex build_mutex;
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 7cfe5ff..f779765 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -255,7 +255,7 @@ GraphicsPipeline::GraphicsPipeline(
+     vk::PipelineCache& pipeline_cache_, VideoCore::ShaderNotify* shader_notify,
+     const Device& device_, DescriptorPool& descriptor_pool,
+     GuestDescriptorQueue& guest_descriptor_queue_, DescriptorBufferRing& descriptor_buffer_ring_,
+-    Common::ThreadWorker* worker_thread,
++    Common::ThreadWorker* worker_thread, Common::ThreadWorker* optimize_worker,
+     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
+     const GraphicsPipelineCacheKey& key_, std::shared_ptr<const GraphicsShaderModules> modules,
+     const std::array<const Shader::Info*, NUM_STAGES>& infos)
+@@ -312,11 +312,18 @@ GraphicsPipeline::GraphicsPipeline(
+         }
+     }
+ 
+-    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics] {
++    // Fast-first pipelines (EDEN_FAST_FIRST_PIPELINES, vk_pipeline_cache.cpp): a pipeline built
++    // while the game runs, which its first draw waits for, is built without the driver's
++    // optimizations, in a fraction of the time, then again with them on the optimize worker.
++    // Pipelines built from the disk cache at boot (no worker_thread) are built optimized at once.
++    const bool fast_first{worker_thread != nullptr && optimize_worker != nullptr};
++    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics, optimize_worker,
++               fast_first] {
+         const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
+         Validate();
+         try {
+-            MakePipeline(render_pass);
++            pipeline = MakePipeline(render_pass,
++                                    fast_first ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0);
+         } catch (const vk::Exception& exception) {
+             LOG_CRITICAL(Render_Vulkan, "Graphics pipeline build failed: {}", exception.what());
+             std::scoped_lock lock{build_mutex};
+@@ -330,6 +337,20 @@ GraphicsPipeline::GraphicsPipeline(
+         if (pipeline_statistics) {
+             pipeline_statistics->Collect(device, *pipeline);
+         }
++        if (fast_first) {
++            // The pipeline cache outlives the optimize worker, which drops queued rebuilds and
++            // finishes the running one when it stops (vk_pipeline_cache.h).
++            optimize_worker->QueueWork([this, render_pass] {
++                try {
++                    optimized_pipeline = MakePipeline(render_pass);
++                    optimized_ready.store(true, std::memory_order_release);
++                } catch (const vk::Exception& exception) {
++                    // The unoptimized pipeline stays in use.
++                    LOG_WARNING(Render_Vulkan, "Optimized graphics pipeline build failed: {}",
++                                exception.what());
++                }
++            });
++        }
+ 
+         std::scoped_lock lock{build_mutex};
+         is_built = true;
+@@ -678,7 +699,10 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+             if (!pipeline) {
+                 return;
+             }
+-            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
++            // Both variants share the layout: what is bound with one stays valid with the other.
++            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
++                                optimized_ready.load(std::memory_order_acquire) ? *optimized_pipeline
++                                                                                : *pipeline);
+         }
+         cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+                              RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
+@@ -716,7 +740,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+     return true;
+ }
+ 
+-void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
++vk::Pipeline GraphicsPipeline::MakePipeline(VkRenderPass render_pass,
++                                            VkPipelineCreateFlags extra_flags) {
+     FixedPipelineState::DynamicState dynamic{};
+     if (!key.state.extended_dynamic_state) {
+         dynamic = key.state.dynamic_state;
+@@ -1101,7 +1126,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+                 .pSpecializationInfo = nullptr,
+             });
+     }
+-    VkPipelineCreateFlags flags{};
++    VkPipelineCreateFlags flags{extra_flags};
+     if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
+         flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+     }
+@@ -1109,7 +1134,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+     }
+ 
+-    pipeline = device.GetLogical().CreateGraphicsPipeline({
++    vk::Pipeline result = device.GetLogical().CreateGraphicsPipeline({
+         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+         .pNext = nullptr,
+         .flags = flags,
+@@ -1129,7 +1154,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         .subpass = 0,
+         .basePipelineHandle = nullptr,
+         .basePipelineIndex = 0,
+-    }, *pipeline_cache);
++    }, (extra_flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0
++           // The unoptimized pipeline lives one session: the next boot builds it optimized.
++           ? VkPipelineCache{VK_NULL_HANDLE} : *pipeline_cache);
+ 
+     // Log graphics pipeline creation
+     if (GPU::Logging::IsActive()) {
+@@ -1140,6 +1167,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         );
+         GPU::Logging::GPULogger::GetInstance().LogPipelineStateChange(pipeline_info);
+     }
++    return result;
+ }
+ 
+ void GraphicsPipeline::Validate() {
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index 39fd868..264784d 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -88,6 +88,7 @@ public:
+         const Device& device, DescriptorPool& descriptor_pool,
+         GuestDescriptorQueue& guest_descriptor_queue,
+         DescriptorBufferRing& descriptor_buffer_ring, Common::ThreadWorker* worker_thread,
++        Common::ThreadWorker* optimize_worker,
+         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
+         const GraphicsPipelineCacheKey& key,
+         std::shared_ptr<const GraphicsShaderModules> modules,
+@@ -147,7 +148,7 @@ private:
+     bool ConfigureDraw(const RescalingPushConstant& rescaling,
+                        const RenderAreaPushConstant& render_are);
+ 
+-    void MakePipeline(VkRenderPass render_pass);
++    vk::Pipeline MakePipeline(VkRenderPass render_pass, VkPipelineCreateFlags extra_flags = 0);
+ 
+     void Validate();
+ 
+@@ -182,6 +183,10 @@ private:
+     vk::PipelineLayout pipeline_layout;
+     vk::DescriptorUpdateTemplate descriptor_update_template;
+     vk::Pipeline pipeline;
++    /// Fast-first pipelines: `pipeline` was built without the driver's optimizations and this one
++    /// with them, on the optimize worker. Binds take it once optimized_ready is set.
++    vk::Pipeline optimized_pipeline;
++    std::atomic_bool optimized_ready{false};
+ 
+     DescriptorBufferLayout descriptor_buffer_layout;
+     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 4f0155f..96d100a 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -382,6 +382,15 @@ bool IsAsyncTranslationAllowed() {
+     return value == nullptr || value[0] != '0';
+ }
+ 
++// EDEN_FAST_FIRST_PIPELINES=1: a pipeline built while the game runs, which its first draw or
++// dispatch waits for, is built without the driver's optimizations (a fraction of the compile time)
++// and again with them on one background worker; draws take the optimized one once it is there.
++// Pipelines built from the disk cache at boot are built optimized at once. Off unless set.
++bool IsFastFirstPipelinesEnabled() {
++    const char* const value = std::getenv("EDEN_FAST_FIRST_PIPELINES");
++    return value != nullptr && value[0] == '1';
++}
++
+ // Translation threads get half of the pipeline workers' count; driver compilation is queued
+ // on the pipeline workers.
+ size_t GetTotalTranslationWorkers() {
+@@ -427,7 +436,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+       use_async_translation{use_asynchronous_shaders && IsAsyncTranslationAllowed() &&
+                             !device.HasBrokenParallelShaderCompiling()},
+       use_shader_reuse{IsShaderReuseAllowed()},
++      use_fast_first_pipelines{IsFastFirstPipelinesEnabled()},
+       num_translation_threads{use_async_translation ? GetTotalTranslationWorkers() : 0},
++      optimize_worker(use_fast_first_pipelines ? 1 : 0, "VkPipelineOptimizer", {},
++                      Common::ThreadPlacement::Background),
+       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
+               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
+       serialization_thread(1, "VkPipelineSerialization", {},
+@@ -444,6 +456,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+     }
+     LOG_INFO(Render_Vulkan, "Graphics pipelines {} the shaders of earlier pipelines that fit them",
+              use_shader_reuse ? "reuse" : "do not reuse (EDEN_NX2_SHADER_REUSE=0)");
++    LOG_INFO(Render_Vulkan, "Pipelines built at run time {}",
++             use_fast_first_pipelines
++                 ? "start unoptimized and are rebuilt optimized on a worker"
++                 : "are built optimized (EDEN_FAST_FIRST_PIPELINES=1 starts them unoptimized)");
+     const auto& float_control{device.FloatControlProperties()};
+     const VkDriverId driver_id{device.GetDriverID()};
+     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
+@@ -999,10 +1015,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+         }
+     }
+     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
++    Common::ThreadWorker* const optimizer{use_fast_first_pipelines ? &optimize_worker : nullptr};
+     return std::make_unique<GraphicsPipeline>(
+         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
+-        descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
+-        render_pass_cache, key, shaders->modules, shaders->InfoPointers());
++        descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, optimizer,
++        statistics, render_pass_cache, key, shaders->modules, shaders->InfoPointers());
+ 
+ } catch (const Shader::Exception& exception) {
+     LOG_ERROR(Render_Vulkan, "{}", exception.what());
+@@ -1500,9 +1517,10 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+         spv_module.SetObjectNameEXT(name.c_str());
+     }
+     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
++    Common::ThreadWorker* const optimizer{use_fast_first_pipelines ? &optimize_worker : nullptr};
+     return std::make_unique<ComputePipeline>(device, scheduler, vulkan_pipeline_cache, descriptor_pool,
+                                              guest_descriptor_queue, descriptor_buffer_ring,
+-                                             thread_worker, statistics,
++                                             thread_worker, optimizer, statistics,
+                                              &shader_notify, program.info, std::move(spv_module),
+                                              key.unique_hash);
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 9d08b8b..a542614 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -222,6 +222,7 @@ private:
+     bool use_vulkan_pipeline_cache{};
+     bool use_async_translation{};
+     bool use_shader_reuse{};
++    bool use_fast_first_pipelines{};
+     size_t num_translation_threads{};
+ 
+     GraphicsPipelineCacheKey graphics_key{};
+@@ -248,6 +249,12 @@ private:
+     std::atomic<size_t> last_cache_size{};
+     std::atomic_bool flush_in_flight{};
+ 
++    /// Fast-first pipelines: builds the optimized variant of pipelines first built without the
++    /// driver's optimizations. Declared after the caches and the Vulkan pipeline cache, and before
++    /// the pipeline workers that queue its work: those stop first, then it finishes the rebuild
++    /// it is running (and drops the queued ones) while every pipeline it builds for is alive.
++    Common::ThreadWorker optimize_worker;
++
+     Common::ThreadWorker workers;
+     Common::ThreadWorker serialization_thread;
+     DynamicFeatures dynamic_features;

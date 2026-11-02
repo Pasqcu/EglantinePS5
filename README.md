@@ -288,6 +288,8 @@ A game can have its own values: in its settings, **Performance** (see [Settings 
 }
 ```
 
+**Fast-first pipelines** (`fast_pipelines`, on; only in the settings file). A shader a game meets for the first time is built without the graphics driver's optimizations, which takes a fraction of the time, so the game pauses far less for it; a background thread then builds the optimized one and draws switch to it. No draw is skipped, so nothing goes missing from the picture, and shaders loaded at a game's start from its shader cache are built optimized as before. `"fast_pipelines": false` under `"performance"` (or in a game's own `"performance"`) builds every new shader optimized at once. The session log says which one it used (`Pipelines built at run time ...`). The idea comes from [ProsperoEden Encore](https://github.com/niakw/ProsperoEden-Encore).
+
 The accuracy switches help only where a game is held back by what they relax. In the scene they were measured in on the console, a large game standing at its frame rate limit, switching all of them on changed neither the frame rate nor how busy the emulated processor and the graphics thread were. Leave them off unless a game runs under its frame rate, and switch them back off if its graphics go wrong.
 
 Resolution, the upscaling filter, the renderer and the refresh rate, which change speed too, are in **Settings > Video** and in a game's own settings.

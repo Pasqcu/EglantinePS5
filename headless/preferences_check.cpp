@@ -328,6 +328,17 @@ int main() {
     speed = Eden::LoadPerformance(racer, by_hand);
     assert(!speed.skip_invalidation && !speed.reactive_flushing);
     assert(Eden::LoadPerformance(quest, by_hand).skip_invalidation && Eden::LoadPerformance(quest, by_hand).reactive_flushing);
+    // Fast-first pipelines are on unless the file turns them off, for every game or for one, and
+    // saving the general values keeps a choice the launcher has no switch for.
+    assert(Eden::LoadPerformance(racer, by_hand).fast_pipelines);
+    std::ofstream(by_hand) << R"({"performance": {"fast_pipelines": false},
+        "games": {"0100000000010000": {"performance": {"fast_pipelines": true}}}})";
+    assert(Eden::LoadPerformance(racer, by_hand).fast_pipelines);
+    speed = Eden::LoadPerformance(quest, by_hand);
+    assert(!speed.fast_pipelines);
+    speed.fast_gpu = true;
+    assert(Eden::SavePerformance(0, speed, by_hand));
+    assert(!Eden::LoadPerformance(quest, by_hand).fast_pipelines);
 
     // Button mapping (button_mapping.h): the usual one, a changed one, and one the file names
     // badly. Choosing a button another game button has swaps the two.

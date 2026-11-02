@@ -1035,6 +1035,11 @@ int main(int argc, char** argv) {
             // every session at their exact values (above), so one that is not chosen is off.
             const auto speed = Eden::LoadPerformance(eden_game_title_id(guest));
             Settings::values.use_asynchronous_shaders = speed.async_shaders;
+            // Fast-first pipelines ("fast_pipelines", on unless the file turns it off): a shader a
+            // draw waits for is built without the driver's optimizations first, and optimized on a
+            // worker after (tools/eglantine-patches/0010-fast-first-pipelines.patch). The pipeline
+            // cache reads it when the session's renderer starts.
+            setenv("EDEN_FAST_FIRST_PIPELINES", speed.fast_pipelines ? "1" : "0", 1);
             if (speed.fast_gpu) {
                 // Nothing calls UpdateGPUAccuracy() here; set the live value too.
                 Settings::values.gpu_accuracy.SetValue(Settings::GpuAccuracy::Low);
@@ -1051,6 +1056,7 @@ int main(int argc, char** argv) {
             const auto on = [](bool value) { return value ? "on" : "off"; };
             Eden::Report("launch", (std::string("Performance: block list ") + on(Eden::JitList::enabled) +
                                     ", async shaders " + on(Settings::values.use_asynchronous_shaders.GetValue()) +
+                                    ", fast-first pipelines " + on(speed.fast_pipelines) +
                                     ", fast GPU " + on(!Settings::IsGPULevelHigh()) +
                                     ", unsafe CPU " +
                                     on(Settings::values.cpu_accuracy.GetValue() == Settings::CpuAccuracy::Unsafe) +
